@@ -102,7 +102,7 @@ class InterfaceConfig(MultipleAdsorbateSlabConfig):
         interstitial_gap: float = 0.1,
         vacuum_size: int = 15,
         solvent_interstitial_gap: float = 2,
-        solvent_depth: float = 8,
+        solvent_depth: float = 5,
         pbc_shift: float = 0.0,
         packmol_tolerance: float = 2,
         mode: str = "random_site_heuristic_placement",
@@ -123,12 +123,12 @@ class InterfaceConfig(MultipleAdsorbateSlabConfig):
         self.solvent_interstitial_gap = solvent_interstitial_gap
         self.pbc_shift = pbc_shift
         self.packmol_tolerance = packmol_tolerance
-
         self.n_mol_per_volume = solvent.molecules_per_volume
 
         self.atoms_list, self.metadata_list = self.create_interface_on_sites(
             self.atoms_list, self.metadata_list
         )
+        
 
     def create_interface_on_sites(
         self, atoms_list: list[ase.Atoms], metadata_list: list[dict]
@@ -138,9 +138,74 @@ class InterfaceConfig(MultipleAdsorbateSlabConfig):
         (Multi)AdsorbateSlabConfig and its corresponding metadata, create the
         solvent/ion interface on top of the provided atoms objects.
         """
+        from ase.build import minimize_rotation_and_translation
         atoms_interface_list = []
         metadata_interface_list = []
+        
+        
+        
+        def Z_shift(atoms,gap):
+            tag_array = atoms.get_tags()
+            New_positions = atoms.positions
+            minz = min(atoms[atoms.get_tags() == 3].positions[:,2])
+            maxz = max(atoms[atoms.get_tags() == 1].positions[:,2])
+            P1 = np.array([0,0,0])
+            P2 = np.array([0,0,0])
+            start_flag = [True,True]
+            for i in range(len(tag_array)):
+                if tag_array[i] == 1:
+                    if atoms[i].position[2] > P1[2] or start_flag[0]:
+                        P1 = atoms[i].position
+                        start_flag[0] = False
+                elif tag_array[i] == 3:
+                    if atoms[i].position[2] < P2[2] or start_flag[1]:
+                        P2 = atoms[i].position
+                        start_flag[1] = False
+                        
+            a = atoms.cell[0, :]  # First column
+            b = atoms.cell[1, :]  # Second column
+            normal = np.cross(a, b)
+            # Normalize the normal vector
+            normal = normal / np.linalg.norm(normal)
+            DeltaZ = np.dot(P2, normal)- np.dot(P1, normal)
+            print(np.dot(P2, normal),np.dot(P1, normal))
+            Zdif = minz- maxz
+            print(minz,maxz,DeltaZ,Zdif)
+            if DeltaZ< (gap+0.2):
+                if DeltaZ<0:
+                    shift = normal*(gap - DeltaZ)
+                else:
+                    shift = normal*(gap)
+                print(shift)
+                for i in range(len(tag_array)):
+                    if tag_array[i] ==3:
+                        New_positions[i,:] +=shift
+            atoms_new = atoms.copy()
+            atoms_new.set_positions(New_positions)
+            return atoms_new
 
+            def align_points(source, target):
+                from scipy.spatial.transform import Rotation
+                
+                centroid_source = np.mean(source, axis=0)
+                centroid_target = np.mean(target, axis=0)
+            
+                source_centered = source - centroid_source
+                target_centered = target - centroid_target
+            
+                H = np.dot(source_centered.T, target_centered)
+                U, S, Vt = np.linalg.svd(H)
+                rotation_matrix = np.dot(Vt.T, U.T)
+            
+                if np.linalg.det(rotation_matrix) < 0:
+                    Vt[-1, :] *= -1
+                    rotation_matrix = np.dot(Vt.T, U.T)
+            
+                aligned_source = np.dot(source_centered, rotation_matrix) + centroid_target
+            
+                translation = centroid_target - np.dot(centroid_source, rotation_matrix)
+        
+                return (translation, rotation_matrix)
         for atoms, adsorbate_metadata in zip(atoms_list, metadata_list):
             cell = atoms.cell.copy()
             unit_normal = cell[2] / np.linalg.norm(cell[2])
@@ -158,16 +223,28 @@ class InterfaceConfig(MultipleAdsorbateSlabConfig):
 
             solvent_ions_atoms = self.create_packmol_atoms(geometry, n_solvent_mols)
             solvent_ions_atoms.set_cell(cell)
+            atoms1 = atoms[atoms.get_tags() == 2].copy()
+            atoms2 = solvent_ions_atoms[solvent_ions_atoms.get_tags() == 4].copy()
+            atoms1.pcb=[0,0,0]
+            atoms2.pcb=[0,0,0]
+            #minimize_rotation_and_translation(atoms1,atoms2)
+            T,R = align_points(solvent_ions_atoms[solvent_ions_atoms.get_tags() == 4].positions,atoms1.positions)
+            solvent_ions_atoms.set_positions(solvent_ions_atoms.positions + T)
+            
 
-            max_z = atoms.positions[:, 2].max() + self.solvent_interstitial_gap
-            translation_vec = cell[2]
-            translation_vec[2] = max_z
-            solvent_ions_atoms.translate(translation_vec)
+
+            #max_z = atoms.positions[:, 2].max() + self.solvent_interstitial_gap
+            #translation_vec = cell[2]
+            #translation_vec[2] = max_z
+            #solvent_ions_atoms.translate(translation_vec)
 
             interface_atoms = atoms + solvent_ions_atoms
             interface_atoms.center(vacuum=self.vacuum_size, axis=2)
             interface_atoms.wrap()
-
+            interface_atoms = Z_shift(interface_atoms,self.solvent_interstitial_gap)
+            mask = interface_atoms.get_tags() != 4
+            interface_atoms = interface_atoms[mask]
+            interface_atoms.wrap()
             atoms_interface_list.append(interface_atoms)
 
             metadata = {
@@ -214,6 +291,17 @@ class InterfaceConfig(MultipleAdsorbateSlabConfig):
                 self.randomize_coords(ion_atoms)
                 ion_atoms.write(f"{tmp_dir}/ion_{i}.pdb", format="proteindatabank")
 
+            for i, adsorbate in enumerate(self.atoms_list):
+                mask = self.atoms_list[i].get_tags() == 2
+                adsorbate_atoms = self.atoms_list[i][mask].copy()
+                #adsorbate_atoms = adsorbate
+                adsorbate_atoms.set_cell(cell)
+                #self.randomize_coords(adsorbate)
+                CoM = adsorbate_atoms.get_center_of_mass()
+                adsorbate_atoms.positions[:, :2] -= CoM[:2]
+                adsorbate_atoms.positions[:, 2] -= adsorbate_atoms.positions[:, 2].min()
+                adsorbate_atoms.write(f"{tmp_dir}/adsorbate_{i}.pdb", format="proteindatabank")
+
             # write packmol input
             packmol_input = os.path.join(tmp_dir, "input.inp")
             with open(packmol_input, "w") as f:
@@ -234,11 +322,21 @@ class InterfaceConfig(MultipleAdsorbateSlabConfig):
                     f.write("  fixed 0 0 0 0 0 0\n")
                     f.write("end structure\n\n")
 
+                for i in range(len(self.atoms_list)):
+                    f.write(f"structure {tmp_dir}/adsorbate_{i}.pdb\n")
+                    f.write("  number 1\n")
+                    f.write("  center \n")
+                    f.write("  fixed 0 0 0 0 0 0\n")
+#                    f.write("  radius 1.5 \n")
+                    f.write("end structure\n\n")
             self.run_packmol(packmol_input)
 
             solvent_ions_atoms = ase.io.read(output_path, format="proteindatabank")
             solvent_ions_atoms.set_pbc(True)
             solvent_ions_atoms.set_tags([3] * len(solvent_ions_atoms))
+            tags_w_ads = solvent_ions_atoms.get_tags()
+            tags_w_ads[-len(adsorbate_atoms):] = len(adsorbate_atoms)*[4]
+            solvent_ions_atoms.set_tags(tags_w_ads)
 
         return solvent_ions_atoms
 
@@ -246,7 +344,7 @@ class InterfaceConfig(MultipleAdsorbateSlabConfig):
         """
         Run packmol.
         """
-        packmol_cmd = which("packmol")
+        packmol_cmd = which("/Users/mikaelmaraschin/packmol-20.15.3/packmol")
         if not packmol_cmd:
             raise OSError("packmol not found.")
 
@@ -268,3 +366,5 @@ class InterfaceConfig(MultipleAdsorbateSlabConfig):
         cell_weights /= np.sum(cell_weights)
         xyz = np.dot(cell_weights, atoms.cell)
         atoms.set_center_of_mass(xyz)
+        
+    
